@@ -1,0 +1,1043 @@
+#include <stdio.h>
+#include <string.h>
+#include <wiringPi.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <time.h>
+#include <pthread.h>
+#include <gtk/gtk.h>
+#include <sys/stat.h>
+#include <signal.h>
+
+#define FIFO_PATH  "/tmp/qrpipe"
+#define DATA_FILE  "inventory_data.csv"
+#define COUNT_FILE "inventory_count.csv"
+#define TEMP_FILE  "temp.csv"
+
+GtkWidget *entry_product;
+GtkWidget *label_status;
+
+volatile int abort_motion = 0;
+volatile int stop_input_mode = 0;
+
+GtkWidget *treeview_inventory;
+GtkListStore *inventory_store;
+
+
+//------------------------------------------------------------------------------------servo--v
+
+
+#define SERVO1 19
+#define SERVO2 12
+#define SERVO3 18
+#define SERVO4 13
+
+#define BUTTON 21
+
+#define SERVO1_REST 90
+#define SERVO2_REST 170
+#define SERVO3_REST 140
+#define SERVO4_REST 140
+
+
+#define MODES 8
+#define SERVOS 5
+#define STEPS 7
+
+int speed1 = 30;
+int ledPin = 22;
+int ir_sensor = 26;
+
+volatile int e_button=1;
+
+int ir_error=0;
+int output_mode_check=0;
+
+pthread_t t1, t2, t3, t4 ,t5 ,t6;
+pid_t qr_pid;
+
+#define THREAD_COUNT 5
+
+pthread_barrier_t barrier;
+
+#define SERVO_FILE "servo_pos.csv"
+
+char product[120];
+
+void* input_mode();
+void output_mode();
+
+
+//-----------------------------------servo present values
+int servo_1=90;
+int servo_2=170;
+int servo_3=140;
+int servo_4=140;
+//-----------------------------------servo present values
+
+//---------------------------------------------------------------------------------------datalog--------V
+/* ---------- TIME ---------- */
+void get_time(char *buf) {
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    sprintf(buf, "%04d-%02d-%02d %02d:%02d:%02d",
+            t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
+            t->tm_hour, t->tm_min, t->tm_sec);
+}
+
+/* ---------- INIT ---------- */
+void init_inventory() {
+    FILE *fp;
+
+    fp = fopen(DATA_FILE, "r");
+    if (!fp) {
+        fp = fopen(DATA_FILE, "w");
+        fprintf(fp, "item_id,action,time\n");
+    }
+    fclose(fp);
+
+    fp = fopen(COUNT_FILE, "r");
+    if (!fp) {
+        fp = fopen(COUNT_FILE, "w");
+        fprintf(fp, "item_id,count\n");
+    }
+    fclose(fp);
+
+    if (access(FIFO_PATH, F_OK) == -1) {
+        mkfifo(FIFO_PATH, 0666);
+    }
+}
+
+/* ---------- LOG EVENT ---------- */
+void log_event(const char *item, const char *action) {
+    FILE *fp = fopen(DATA_FILE, "a");
+    char timebuf[64];
+    get_time(timebuf);
+    fprintf(fp, "%s,%s,%s\n", item, action, timebuf);
+    fclose(fp);
+}
+
+/* ---------- STORE ---------- */
+void store_item(const char *item) {
+    FILE *fp = fopen(COUNT_FILE, "r");
+    FILE *temp = fopen(TEMP_FILE, "w");
+
+    char line[128], name[64];
+    int count, found = 0;
+
+    fgets(line, sizeof(line), fp); // header
+    fputs(line, temp);
+
+    while (fgets(line, sizeof(line), fp)) {
+        sscanf(line, "%[^,],%d", name, &count);
+
+        if (strcmp(name, item) == 0) {
+            count++;
+            found = 1;
+        }
+        fprintf(temp, "%s,%d\n", name, count);
+    }
+
+    if (!found) {
+        fprintf(temp, "%s,1\n", item);
+    }
+
+    fclose(fp);
+    fclose(temp);
+
+    remove(COUNT_FILE);
+    rename(TEMP_FILE, COUNT_FILE);
+
+    log_event(item, "STORE");
+    printf("? STORED: %s\n", item);
+}
+
+/* ---------- RETRIEVE ---------- */
+void retrieve_item(const char *item) {
+    FILE *fp = fopen(COUNT_FILE, "r");
+    FILE *temp = fopen(TEMP_FILE, "w");
+
+    char line[128], name[64];
+    int count, found = 0, success = 0;
+
+    fgets(line, sizeof(line), fp); // header
+    fputs(line, temp);
+
+    while (fgets(line, sizeof(line), fp)) {
+        sscanf(line, "%[^,],%d", name, &count);
+
+        if (strcmp(name, item) == 0) {
+            found = 1;
+            if (count > 0) {
+                count--;
+                success = 1;
+            }
+        }
+        fprintf(temp, "%s,%d\n", name, count);
+    }
+
+    fclose(fp);
+    fclose(temp);
+
+    remove(COUNT_FILE);
+    rename(TEMP_FILE, COUNT_FILE);
+
+    if (found && success) {
+        log_event(item, "RETRIEVE");
+        printf("?? RETRIEVED: %s\n", item);
+    } else {
+        printf("? NOT AVAILABLE: %s\n", item);
+    }
+}
+
+void on_stop_clicked(GtkButton *button, gpointer data)//gtk
+{
+    stop_input_mode = 1;
+    abort_motion = 1;
+    ir_error = 1;
+
+    gtk_label_set_text(GTK_LABEL(label_status), "Stopped. Select Mode.");
+}
+
+void init_inventory_table()
+{
+    inventory_store = gtk_list_store_new(2, G_TYPE_STRING, G_TYPE_INT);
+
+    treeview_inventory = gtk_tree_view_new_with_model(GTK_TREE_MODEL(inventory_store));
+
+    GtkCellRenderer *renderer;
+
+    renderer = gtk_cell_renderer_text_new();
+    gtk_tree_view_insert_column_with_attributes(
+        GTK_TREE_VIEW(treeview_inventory), -1,
+        "Product", renderer, "text", 0, NULL);
+
+    renderer = gtk_cell_renderer_text_new();
+    gtk_tree_view_insert_column_with_attributes(
+        GTK_TREE_VIEW(treeview_inventory), -1,
+        "Count", renderer, "text", 1, NULL);
+}
+
+void load_inventory_into_table()
+{
+    gtk_list_store_clear(inventory_store);
+
+    FILE *fp = fopen(COUNT_FILE, "r");
+    if (!fp) return;
+
+    char line[128], name[64];
+    int count;
+
+    fgets(line, sizeof(line), fp); // skip header
+
+    while (fgets(line, sizeof(line), fp)) {
+        sscanf(line, "%[^,],%d", name, &count);
+
+        GtkTreeIter iter;
+        gtk_list_store_append(inventory_store, &iter);
+        gtk_list_store_set(inventory_store, &iter,
+                           0, name,
+                           1, count,
+                           -1);
+    }
+
+    fclose(fp);
+}
+
+int get_product_count(const char *item)
+{
+    FILE *fp = fopen(COUNT_FILE, "r");
+    if (!fp) return 0;
+
+    char line[128], name[64];
+    int count;
+
+    fgets(line, sizeof(line), fp); // header
+
+    while (fgets(line, sizeof(line), fp)) {
+        sscanf(line, "%[^,],%d", name, &count);
+        if (strcmp(name, item) == 0) {
+            fclose(fp);
+            return count;
+        }
+    }
+
+    fclose(fp);
+    return 0;
+}
+
+
+
+//---------------------------------------------------------------------------------------datalog-^
+
+
+
+
+/* Mode-based angle table */
+int modes[MODES][SERVOS][STEPS] =
+{
+    // MODE 1
+    {
+        {90,172,172,5,5,5,90},
+        {170,173,149,149,159,119,170},
+        {140,35,68,68,25,110,140},
+        {140,140,110,110,102,136,140},
+        {0,0,1,1,1,0,0}
+    },
+
+    // MODE 2
+    {
+        {90,172,172,25,25,25,90},
+        {170,173,149,149,159,119,170},
+        {140,35,68,68,25,110,140},
+        {140,140,120,120,102,136,140},
+        {0,0,1,1,1,0,0}
+    },
+
+    // MODE 3
+    {
+        {90,172,172,42,42,42,90},
+        {170,173,149,149,159,119,170},
+        {140,35,68,68,25,110,140},
+        {140,140,90,90,102,136,140},
+        {0,0,1,1,1,0,0}
+    },
+
+    // MODE 4
+    {
+        {90,172,172,58,58,58,90},
+        {170,173,149,149,159,119,170},
+        {140,35,68,70,25,110,140},
+        {140,140,90,90,102,136,140},
+        {0,0,1,1,1,0,0}
+    },
+
+    // MODE 11
+    {
+        {90,5,5,170,170,170,90},
+        {170,145,125,125,180,180,170},
+        {140,28,90,90,37,90,140},
+        {140,108,108,108,138,140,140},
+        {0,0,1,1,1,0,0}
+    },
+    // MODE 12
+    {
+        {90,25,25,170,170,170,90},
+        {170,145,125,125,180,180,170},
+        {140,28,90,90,37,90,140},
+        {140,100,108,108,138,140,140},
+        {0,0,1,1,1,0,0}
+    },	
+    // MODE 13
+    {
+        {90,42,42,170,170,170,90},
+        {170,145,125,125,180,180,170},
+        {140,23,90,90,37,90,140},
+        {140,100,100,108,138,140,140},
+        {0,0,1,1,1,0,0}
+    },
+    // MODE 14
+    {
+        {90,58,58,170,170,170,90},
+        {170,145,125,125,180,180,170},
+        {140,23,90,90,37,90,140},
+        {140,100,100,108,138,140,140},
+        {0,0,1,1,1,0,0}
+    },
+};
+
+int selectedMode;
+
+/* Angle ? PWM */
+int angleToPwm(int angle)
+{
+    return 50 + (angle * 200) / 180;
+}
+
+
+
+
+
+void save_servo_position()
+{
+    FILE *fp = fopen(SERVO_FILE, "w");
+    if (!fp) {
+        perror("Servo file write error");
+        return;
+    }
+
+    fprintf(fp, "servo1,servo2,servo3,servo4\n");
+    fprintf(fp, "%d,%d,%d,%d\n", servo_1, servo_2, servo_3, servo_4);
+
+    fclose(fp);
+}
+
+void emerg_button() {
+    int buttonState = digitalRead(BUTTON);
+
+    if (buttonState == LOW) {   
+        gtk_label_set_text(GTK_LABEL(label_status), "Emergency Stop restart the arm");
+
+        while (e_button) {
+            
+        }
+    }
+}
+
+void flush_fifo() {
+    int fd = open("/tmp/qrpipe", O_RDONLY | O_NONBLOCK);
+    if (fd < 0) return;
+
+    char dump[128];
+    while (read(fd, dump, sizeof(dump)) > 0) {
+        // discard silently
+    }
+
+    close(fd);
+}
+
+int check_product_with_qr()
+{
+    printf("product cheking start..........................\n");
+    char qr_buffer[120];
+    const char *fifo_path = "/tmp/qrpipe";
+
+    while (1) {
+
+        FILE *fp = fopen(fifo_path, "r");
+        if (!fp) {
+            perror("FIFO open error");
+            return 0;
+        }
+
+        if (!fgets(qr_buffer, sizeof(qr_buffer), fp)) {
+            fclose(fp);
+            continue;
+        }
+
+        fclose(fp);
+
+        // remove newline
+        qr_buffer[strcspn(qr_buffer, "\n")] = 0;
+
+        // ignore junk
+        if (strcmp(qr_buffer, "0") == 0 || strlen(qr_buffer) < 3)
+            continue;
+
+        printf("Entered Product : %s\n", product);
+        printf("QR Scanned      : %s\n", qr_buffer);
+
+        // compare
+        if (strcmp(product, qr_buffer) == 0) {
+            flush_fifo();     // VERY IMPORTANT
+            return 1;         // match
+        } else {
+            flush_fifo();
+            return 0;         // mismatch
+        }
+    }
+}
+
+
+
+/* ---------- SERVO FUNCTIONS ---------- */
+
+void *servo1(void *arg)
+{
+    int current = angleToPwm(modes[selectedMode][0][0]);
+
+    for (int i = 0; i < STEPS; i++)
+    {
+		printf("count:%d\n",i);
+        int target = angleToPwm(modes[selectedMode][0][i]);
+        for (int j = current; j != target; j += (j < target ? 1 : -1))
+        {
+            emerg_button();
+			if(ir_error==0){
+            pwmWrite(SERVO1, j);
+            servo_1=j;
+            save_servo_position();
+            delay(speed1);
+		}else{
+            
+			continue;
+		}
+		
+        }
+        current = target;
+        pthread_barrier_wait(&barrier);
+        
+    }
+    
+    
+    return NULL;
+}
+
+void *servo2(void *arg)
+{
+    int current = angleToPwm(modes[selectedMode][1][0]);
+
+    for (int i = 0; i < STEPS; i++)
+    {
+        int target = angleToPwm(modes[selectedMode][1][i]);
+        for (int j = current; j != target; j += (j < target ? 1 : -1))
+        {
+            emerg_button();
+			if(ir_error==0){
+            pwmWrite(SERVO2, j);
+            servo_2=j;
+            save_servo_position();
+            delay(speed1);
+		}else{
+
+			continue;
+		}
+        }
+        current = target;
+        
+         pthread_barrier_wait(&barrier);
+    }
+
+    return NULL;
+}
+
+void *servo3(void *arg)
+{
+    int current = angleToPwm(modes[selectedMode][2][0]);
+
+    for (int i = 0; i < STEPS; i++)
+    {
+        int target = angleToPwm(modes[selectedMode][2][i]);
+        for (int j = current; j != target; j += (j < target ? 1 : -1))
+        {
+            emerg_button();
+			if(ir_error==0){
+
+            pwmWrite(SERVO3, j);
+            servo_3=j;
+            save_servo_position();
+            delay(speed1);
+		}else{
+            
+			continue;
+		}
+        }
+        current = target;
+        pthread_barrier_wait(&barrier);
+    }
+    
+    return NULL;
+}
+
+void *servo4(void *arg)
+{
+    int current = angleToPwm(modes[selectedMode][3][0]);
+
+    for (int i = 0; i < STEPS; i++)
+    {
+        int target = angleToPwm(modes[selectedMode][3][i]);
+        for (int j = current; j != target; j += (j < target ? 1 : -1))
+        {
+            emerg_button();
+			if(ir_error==0){
+            pwmWrite(SERVO4, j);
+            servo_4=j;
+            save_servo_position();
+
+            delay(speed1);
+		}else{
+
+			continue;
+		}
+        }
+        current = target;
+
+        pthread_barrier_wait(&barrier);
+    }
+    
+    
+    return NULL;
+}
+
+void go_to_rest_position_1()
+{
+    digitalWrite(ledPin,LOW);
+    int target1 = angleToPwm(SERVO1_REST);
+    int target2 = angleToPwm(SERVO2_REST);
+    int target3 = angleToPwm(SERVO3_REST);
+    int target4 = angleToPwm(SERVO4_REST);
+
+    int done1 = 0, done2 = 0, done3 = 0, done4 = 0;
+
+    while (!(done1 && done2 && done3 && done4))
+    {
+        if (!done1)
+        {
+            if (servo_1 < target1) servo_1++;
+            else if (servo_1 > target1) servo_1--;
+            else done1 = 1;
+
+            pwmWrite(SERVO1, servo_1);
+        }
+
+        if (!done2)
+        {
+            if (servo_2 < target2) servo_2++;
+            else if (servo_2 > target2) servo_2--;
+            else done2 = 1;
+
+            pwmWrite(SERVO2, servo_2);
+        }
+
+        if (!done3)
+        {
+            if (servo_3 < target3) servo_3++;
+            else if (servo_3 > target3) servo_3--;
+            else done3 = 1;
+
+            pwmWrite(SERVO3, servo_3);
+        }
+
+        if (!done4)
+        {
+            if (servo_4 < target4) servo_4++;
+            else if (servo_4 > target4) servo_4--;
+            else done4 = 1;
+
+            pwmWrite(SERVO4, servo_4);
+        }
+
+        delay(50);   // ?? controls smoothness (increase = slower)
+    }
+
+
+    ir_error = 0;
+
+    save_servo_position();
+}
+
+void *magnet(void *arg)
+{
+    pinMode(ir_sensor, INPUT);
+
+    for (int i = 0; i < STEPS; i++)
+    {
+        int ir_check = digitalRead(ir_sensor);
+        int a = modes[selectedMode][4][i];
+
+        /* --------- IF ABORT, DO NOTHING BUT SYNC --------- */
+        if (abort_motion) {
+            pthread_barrier_wait(&barrier);
+            continue;   // <-- VERY IMPORTANT
+        }
+
+        /* --------- Magnet ON / OFF --------- */
+        digitalWrite(ledPin, a ? HIGH : LOW);
+
+        /* ================= INPUT MODE ================= */
+        if (output_mode_check == 0)
+        {
+            digitalWrite(ledPin, a ? HIGH : LOW);
+            if (i != 1 && i != 2 && i != 5 && i != 6)
+            {
+                if (!ir_check == a) {
+                    printf("object detected (input mode)\n");
+                } else {
+                    printf("error: object not detected (input mode)\n");
+                    ir_error = 1;
+                    abort_motion = 1;
+                }
+            }
+        }
+
+        /* ================= OUTPUT MODE ================= */
+        else
+        {
+            if (i == 1)
+            {
+                if (!check_product_with_qr()) {
+                    printf("product not found\n");
+                    ir_error = 1;
+                    abort_motion = 1;
+                }
+            }
+
+            if (!abort_motion &&
+                i != 1 && i != 2 && i != 5 && i != 6)
+            {
+                if (!ir_check == a) {
+                    printf("object detected (output mode)\n");
+                } else {
+                    printf("error: object not detected (output mode)\n");
+                    ir_error = 1;
+                    abort_motion = 1;
+                }
+            }
+        }
+
+        pthread_barrier_wait(&barrier);
+    }
+
+    /* ---- move to rest AFTER all barriers are done ---- */
+    if (abort_motion) {
+        go_to_rest_position_1();
+    }
+
+    return NULL;
+}
+
+
+
+
+
+void fun(){
+    pthread_create(&t1, NULL, servo1, NULL);
+    pthread_create(&t2, NULL, servo2, NULL);
+    pthread_create(&t3, NULL, servo3, NULL);
+    pthread_create(&t4, NULL, servo4, NULL);
+    pthread_create(&t5, NULL, magnet, NULL);
+
+    pthread_join(t1, NULL);
+    pthread_join(t2, NULL);
+    pthread_join(t3, NULL);
+    pthread_join(t4, NULL);
+    pthread_join(t5, NULL);
+   
+}
+
+
+
+
+
+void on_input_mode_clicked(GtkButton *button, gpointer data)
+{
+    output_mode_check =1;
+    gtk_label_set_text(GTK_LABEL(label_status), "Input Mode Started");
+    output_mode_check = 0;
+    pthread_create(&t6, NULL, input_mode, NULL);
+    pthread_detach(t6);
+}
+
+
+void on_output_mode_clicked(GtkButton *button, gpointer data)
+{
+    flush_fifo();
+    go_to_rest_position_1();
+    const char *text = gtk_entry_get_text(GTK_ENTRY(entry_product));
+
+    if (strlen(text) == 0) {
+        gtk_label_set_text(GTK_LABEL(label_status), "Enter product name!");
+        return;
+    }
+
+    strcpy(product, text);   // USE YOUR EXISTING VARIABLE
+    output_mode_check = 1;
+
+    gtk_label_set_text(GTK_LABEL(label_status), "Output Mode Started");
+
+    if (strcmp(product, "CDAC") == 0) {
+        selectedMode = 4;
+    } else if (strcmp(product, "Amalapuram") == 0) {
+        selectedMode = 5;
+    } else if (strcmp(product, "Hyderabad") == 0) {
+        selectedMode = 6;
+    } else if (strcmp(product, "Visakhapatnam") == 0) {
+        selectedMode = 7;
+    } else {
+        gtk_label_set_text(GTK_LABEL(label_status), "Unknown Product");
+        return;
+    }
+    abort_motion = 0;
+    ir_error = 0;
+    int count = get_product_count(product);
+
+    if (count <= 0) {
+        gtk_label_set_text(GTK_LABEL(label_status), "Product is EMPTY");
+        return;
+    }
+
+
+
+    fun();
+    
+
+    if (abort_motion == 0 && ir_error == 0) {
+        retrieve_item(product);
+        log_event(product, "RETRIEVE");
+        gtk_label_set_text(GTK_LABEL(label_status), "Retrieve Successful");
+        load_inventory_into_table();
+    } else {
+        gtk_label_set_text(GTK_LABEL(label_status), "Retrieve Failed � Not Logged");
+    }
+}
+//------------------------------------------------------------------------------------servo--^
+           
+
+
+
+
+
+
+
+void load_servo_position()
+{
+    FILE *fp = fopen(SERVO_FILE, "r");
+    if (!fp) {
+        printf("Servo position file not found. Using defaults.\n");
+        servo_1 = angleToPwm(SERVO1_REST);
+        servo_2 = angleToPwm(SERVO2_REST);
+        servo_3 = angleToPwm(SERVO3_REST);
+        servo_4 = angleToPwm(SERVO4_REST);
+        return;
+    }
+
+    char line[128];
+
+    // Skip header
+    fgets(line, sizeof(line), fp);
+
+    // Read values
+    if (fgets(line, sizeof(line), fp)) {
+        sscanf(line, "%d,%d,%d,%d",
+               &servo_1, &servo_2, &servo_3, &servo_4);
+    }
+
+    fclose(fp);
+
+    printf("Loaded servo positions: %d %d %d %d\n",
+           servo_1, servo_2, servo_3, servo_4);
+}
+
+
+void start_qr_script()
+{
+    qr_pid = fork();
+
+    if (qr_pid == 0) {
+        // Child process
+        execlp("python3", "python3", "qr3.py", NULL);
+        perror("execlp failed");
+        _exit(1);
+    }
+}
+
+void stop_qr_script()
+{
+    if (qr_pid > 0) {
+        kill(qr_pid, SIGTERM);
+        qr_pid = -1;
+    }
+}
+
+gboolean on_window_close(GtkWidget *widget, GdkEvent *event, gpointer data)
+{
+    printf("Window close clicked\n");
+        e_button=0;
+    /* ---- STOP EVERYTHING CLEANLY ---- */
+    stop_input_mode = 1;      // stop input thread
+    abort_motion = 1;         // stop servos
+    ir_error = 1;
+
+
+    stop_qr_script();         // ?? STOP python qr3.py
+
+    go_to_rest_position_1();  // safe servo position
+
+    gtk_main_quit();          // exit GTK loop
+
+    return TRUE;              // we handled the event
+}
+
+
+
+
+int choise;
+
+int main(int argc, char *argv[])
+{
+    start_qr_script();
+    // ---------- GPIO INIT ----------
+    wiringPiSetupGpio();
+    pinMode(SERVO1, PWM_OUTPUT);
+    pinMode(SERVO2, PWM_OUTPUT);
+    pinMode(SERVO3, PWM_OUTPUT);
+    pinMode(SERVO4, PWM_OUTPUT);
+
+    pinMode(ledPin, OUTPUT);
+    pinMode(BUTTON, INPUT);
+    pullUpDnControl(BUTTON, PUD_UP);
+
+    pwmSetMode(PWM_MODE_MS);
+    pwmSetRange(2000);
+    pwmSetClock(192);
+
+    pthread_barrier_init(&barrier, NULL, THREAD_COUNT);
+    load_servo_position();
+    go_to_rest_position_1();
+
+    // ---------- GTK INIT ----------
+    gtk_init(&argc, &argv);
+
+    GtkWidget *window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_title(GTK_WINDOW(window), "Robotic Arm Control");
+    gtk_window_set_default_size(GTK_WINDOW(window), 380, 250);
+    g_signal_connect(window, "delete-event",G_CALLBACK(on_window_close), NULL);
+
+
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_container_add(GTK_CONTAINER(window), vbox);
+
+    GtkWidget *btn_input = gtk_button_new_with_label("Input Mode");
+    GtkWidget *btn_output = gtk_button_new_with_label("Output Mode");
+
+    entry_product = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(entry_product), "Enter Product Name");
+
+    label_status = gtk_label_new("Idle");
+
+    gtk_box_pack_start(GTK_BOX(vbox), btn_input, FALSE, FALSE, 5);
+    gtk_box_pack_start(GTK_BOX(vbox), entry_product, FALSE, FALSE, 5);
+    gtk_box_pack_start(GTK_BOX(vbox), btn_output, FALSE, FALSE, 5);
+    gtk_box_pack_start(GTK_BOX(vbox), label_status, FALSE, FALSE, 5);
+
+    g_signal_connect(btn_input, "clicked", G_CALLBACK(on_input_mode_clicked), NULL);
+    g_signal_connect(btn_output, "clicked", G_CALLBACK(on_output_mode_clicked), NULL);
+
+    GtkWidget *btn_stop = gtk_button_new_with_label("STOP");
+
+    init_inventory_table();
+    load_inventory_into_table();
+
+    GtkWidget *scrolled = gtk_scrolled_window_new(NULL, NULL);
+    gtk_widget_set_size_request(scrolled, 300, 150);
+    gtk_container_add(GTK_CONTAINER(scrolled), treeview_inventory);
+
+    gtk_box_pack_start(GTK_BOX(vbox), btn_stop, FALSE, FALSE, 5);
+    gtk_box_pack_start(GTK_BOX(vbox), scrolled, TRUE, TRUE, 5);
+
+    g_signal_connect(btn_stop, "clicked", G_CALLBACK(on_stop_clicked), NULL);
+
+
+    gtk_widget_show_all(window);
+    gtk_main();
+
+    pthread_barrier_destroy(&barrier);
+    return 0;
+}
+
+
+char product[120];
+
+
+
+
+char buffer[120];
+void* input_mode() {
+    time_t t = time(NULL);
+    struct tm *tm_info = localtime(&t);
+    const char *fifo_path = "/tmp/qrpipe";
+    stop_input_mode = 0;
+
+
+    while (!stop_input_mode) {
+        go_to_rest_position_1();
+        FILE *fp = fopen(fifo_path, "r");
+        if (!fp) perror("FIFO open error");
+
+        printf("Waiting for QR data...\n");
+
+        if (!fgets(buffer, sizeof(buffer), fp)) {
+            fclose(fp);
+            continue;
+        }
+
+        fclose(fp);
+
+        buffer[strcspn(buffer, "\n")] = 0;
+        
+
+        if (strcmp(buffer, "0") == 0)
+            continue;
+
+        printf("%s Received: %s\n", ctime(&t), buffer);
+
+        if (strcmp(buffer, "CDAC") == 0) {
+			flush_fifo();
+			selectedMode=0;
+			fun();
+            /* ? LOG ONLY IF NO ERROR */
+    if (abort_motion == 0 && ir_error == 0) {
+        store_item(buffer);
+         log_event(buffer, "STORE");
+         printf("? Stored & Logged: %s\n", buffer);
+    } else {
+        printf("? Store failed � Not logged\n");
+    }
+
+    abort_motion = 0;
+    ir_error = 0;
+			flush_fifo();
+        }
+
+        else if (strcmp(buffer, "Amalapuram") == 0) {
+			
+			selectedMode=1;
+			fun();
+            /* ? LOG ONLY IF NO ERROR */
+    if (abort_motion == 0 && ir_error == 0) {
+        store_item(buffer);
+         log_event(buffer, "STORE");
+         printf("? Stored & Logged: %s\n", buffer);
+    } else {
+        printf("? Store failed � Not logged\n");
+    }
+
+    abort_motion = 0;
+    ir_error = 0;
+			flush_fifo();
+        }	
+        else if (strcmp(buffer, "Hyderabad") == 0) {
+			selectedMode=2;
+			fun();
+            /* ? LOG ONLY IF NO ERROR */
+    if (abort_motion == 0 && ir_error == 0) {
+        store_item(buffer);
+         log_event(buffer, "STORE");
+         printf("? Stored & Logged: %s\n", buffer);
+    } else {
+        printf("? Store failed � Not logged\n");
+    }
+
+    abort_motion = 0;
+    ir_error = 0;
+			flush_fifo();
+        }
+        else if (strcmp(buffer, "Visakhapatnam") == 0) {
+			selectedMode=3;
+			fun();
+            /* ? LOG ONLY IF NO ERROR */
+    if (abort_motion == 0 && ir_error == 0) {
+        store_item(buffer);
+         log_event(buffer, "STORE");
+         printf("? Stored & Logged: %s\n", buffer);
+    } else {
+        printf("? Store failed � Not logged\n");
+    }
+
+    abort_motion = 0;
+    ir_error = 0;
+			flush_fifo();
+        }
+        else {
+            printf("Unknown QR\n");
+        }
+
+        load_inventory_into_table();
+            
+            abort_motion = 0;
+             ir_error = 0;
+
+    }
+    gtk_label_set_text(GTK_LABEL(label_status), "Input Mode Stopped");
+
+}
